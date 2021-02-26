@@ -2,6 +2,7 @@
 /**
  * @copyright Copyright (c) 2016-2017 Lukas Reschke <lukas@statuscode.ch>
  * @copyright Copyright (c) 2016 Morris Jobke <hey@morrisjobke.de>
+ * @copyright Copyright (c) 2018 Jonas Sulzer <jonas@violoncello.ch>
  *
  * @license GNU AGPL version 3 or any later version
  *
@@ -35,6 +36,8 @@ class Updater {
 	private $updateAvailable = false;
 	/** @var string */
 	private $requestID = null;
+	/** @var bool */
+	private $disabled = false;
 
 	/**
 	 * Updater constructor
@@ -56,6 +59,12 @@ class Updater {
 		/** @var array $CONFIG */
 		require_once $configFileName;
 		$this->configValues = $CONFIG;
+
+		if (php_sapi_name() !== 'cli' && ($this->configValues['upgrade.disable-web'] ?? false)) {
+			// updater disabled
+			$this->disabled = true;
+			return;
+		}
 
 		$dataDir = $this->getDataDirectoryLocation();
 		if(empty($dataDir) || !is_string($dataDir)) {
@@ -93,6 +102,15 @@ class Updater {
 	}
 
 	/**
+	 * Returns whether the web updater is disabled
+	 *
+	 * @return bool
+	 */
+	public function isDisabled() {
+		return $this->disabled;
+	}
+
+	/**
 	 * Returns current version or "unknown" if this could not be determined.
 	 *
 	 * @return string
@@ -126,6 +144,12 @@ class Updater {
 			$this->updateAvailable = true;
 			$releaseChannel = $this->getCurrentReleaseChannel();
 			$updateText = 'Update to ' . htmlentities($versionString) . ' available. (channel: "' . htmlentities($releaseChannel) . '")<br /><span class="light">Following file will be downloaded automatically:</span> <code class="light">' . $response['url'] . '</code>';
+
+			// only show changelog link for stable releases (non-RC & non-beta)
+			if (!preg_match('!(rc|beta)!i', $versionString)) {
+				$changelogURL = $this->getChangelogURL(substr($version, 0, strrpos($version, '.')));
+				$updateText .= '<br /><a class="external_link" href="' . $changelogURL . '" target="_blank" rel="noreferrer noopener">Open changelog ↗</a>';
+			}
 		} else {
 			$updateText = 'No update available.';
 		}
@@ -174,11 +198,12 @@ class Updater {
 	 * @return array
 	 */
 	private function getExpectedElementsList() {
-		return [
+		$expected = [
 			// Generic
 			'.',
 			'..',
 			// Folders
+			'.well-known',
 			'3rdparty',
 			'apps',
 			'config',
@@ -188,11 +213,13 @@ class Updater {
 			'lib',
 			'ocs',
 			'ocs-provider',
+			'ocm-provider',
 			'resources',
 			'settings',
 			'themes',
 			'updater',
 			// Files
+			'.rnd',
 			'index.html',
 			'indie.json',
 			'.user.ini',
@@ -212,6 +239,26 @@ class Updater {
 			'occ',
 			'db_structure.xml',
 		];
+		return array_merge($expected, $this->getAppDirectories());
+	}
+
+	/**
+	 * Returns app directories specified in config.php
+	 *
+	 * @return array
+	 */
+	private function getAppDirectories() {
+		$expected = [];
+		if($appsPaths = $this->getConfigOption('apps_paths')) {
+			foreach ($appsPaths as $appsPath) {
+				$parentDir = realpath($this->baseDir . '/../');
+				$appDir = basename($appsPath['path']);
+				if(strpos($appsPath['path'], $parentDir) === 0 && $appDir !== 'apps') {
+					$expected[] = $appDir;
+				}
+			}
+		}
+		return $expected;
 	}
 
 	/**
@@ -316,16 +363,15 @@ class Updater {
 		$this->silentLog('[info] createBackup()');
 
 		$excludedElements = [
+			'.rnd',
+			'.well-known',
 			'data',
 		];
 
 		// Create new folder for the backup
-		$backupFolderLocation = $this->getDataDirectoryLocation() . '/updater-'.$this->getConfigOption('instanceid').'/backups/nextcloud-'.$this->getConfigOption('version') . '/';
-		if(file_exists($backupFolderLocation)) {
-			$this->silentLog('[info] backup folder location exists');
+		$backupFolderLocation = $this->getDataDirectoryLocation() . '/updater-'.$this->getConfigOption('instanceid').'/backups/nextcloud-'.$this->getConfigOption('version') . '-' . time() . '/';
+		$this->silentLog('[info] backup folder location: ' . $backupFolderLocation);
 
-			$this->recursiveDelete($backupFolderLocation);
-		}
 		$state = mkdir($backupFolderLocation, 0750, true);
 		if($state === false) {
 			throw new \Exception('Could not create backup folder location');
@@ -365,17 +411,40 @@ class Updater {
 			if($fileInfo->isFile()) {
 				$state = copy($fileInfo->getRealPath(), $backupFolderLocation . $fileName);
 				if($state === false) {
-					throw new \Exception(
-						sprintf(
-							'Could not copy "%s" to "%s"',
-							$fileInfo->getRealPath(),
-							$backupFolderLocation . $fileName
-						)
+					$message = sprintf(
+						'Could not copy "%s" to "%s"',
+						$fileInfo->getRealPath(),
+						$backupFolderLocation . $fileName
 					);
+
+					if(is_readable($fileInfo->getRealPath()) === false) {
+						$message = sprintf(
+							'%s. Source %s is not readable',
+							$message,
+							$fileInfo->getRealPath()
+						);
+					}
+
+					if(is_writable($backupFolderLocation . $fileName) === false) {
+						$message = sprintf(
+							'%s. Destination %s is not writable',
+							$message,
+							$backupFolderLocation . $fileName
+						);
+					}
+
+					throw new \Exception($message);
 				}
 			}
 		}
 		$this->silentLog('[info] end of createBackup()');
+	}
+
+	private function getChangelogURL($versionString) {
+		$this->silentLog('[info] getChangelogURL()');
+		$changelogWebsite = 'https://nextcloud.com/changelog/';
+		$changelogURL = $changelogWebsite . '#' . str_replace('.', '-', $versionString);
+		return $changelogURL;
 	}
 
 	/**
@@ -388,7 +457,7 @@ class Updater {
 		$updaterServer = $this->getConfigOption('updater.server.url');
 		if($updaterServer === null) {
 			// FIXME: used deployed URL
-			$updaterServer = 'https://updates.nextcloud.org/updater_server/';
+			$updaterServer = 'https://updates.nextcloud.com/updater_server/';
 		}
 		$this->silentLog('[info] updaterServer: ' . $updaterServer);
 
@@ -406,6 +475,15 @@ class Updater {
 			CURLOPT_URL => $updateURL,
 			CURLOPT_USERAGENT => 'Nextcloud Updater',
 		]);
+
+		if ($this->getConfigOption('proxy') !== null) {
+			curl_setopt_array($curl, [
+				CURLOPT_PROXY => $this->getConfigOption('proxy'),
+				CURLOPT_PROXYUSERPWD => $this->getConfigOption('proxyuserpwd'),
+				CURLOPT_HTTPPROXYTUNNEL => $this->getConfigOption('proxy') ? 1 : 0,
+			]);
+		}
+
 		$response = curl_exec($curl);
 		if($response === false) {
 			throw new \Exception('Could not do request to updater server: '.curl_error($curl));
@@ -454,7 +532,19 @@ class Updater {
 
 		$fp = fopen($storageLocation . basename($response['url']), 'w+');
 		$ch = curl_init($response['url']);
-		curl_setopt($ch, CURLOPT_FILE, $fp);
+		curl_setopt_array($ch, [
+			CURLOPT_FILE => $fp,
+			CURLOPT_USERAGENT => 'Nextcloud Updater',
+		]);
+
+		if ($this->getConfigOption('proxy') !== null) {
+			curl_setopt_array($ch, [
+				CURLOPT_PROXY => $this->getConfigOption('proxy'),
+				CURLOPT_PROXYUSERPWD => $this->getConfigOption('proxyuserpwd'),
+				CURLOPT_HTTPPROXYTUNNEL => $this->getConfigOption('proxy') ? 1 : 0,
+			]);
+		}
+
 		if(curl_exec($ch) === false) {
 			throw new \Exception('Curl error: ' . curl_error($ch));
 		}
@@ -501,12 +591,15 @@ class Updater {
 		$storageLocation = $this->getDataDirectoryLocation() . '/updater-'.$this->getConfigOption('instanceid') . '/downloads/';
 		$this->silentLog('[info] storage location: ' . $storageLocation);
 
-		$files = scandir($storageLocation);
-		// ., .. and downloaded zip archive
-		if(count($files) !== 3) {
-			throw new \Exception('Not exact 3 files existent in folder');
+		$filesInStorageLocation = scandir($storageLocation);
+		$files = array_values(array_filter($filesInStorageLocation, function($path){
+			return $path !== '.' && $path !== '..';
+		}));
+		// only the downloaded archive
+		if(count($files) !== 1) {
+			throw new \Exception('There are more files than the downloaded archive in the downloads/ folder.');
 		}
-		return $storageLocation . '/' . $files[2];
+		return $storageLocation . '/' . $files[0];
 	}
 
 	/**
@@ -601,14 +694,17 @@ EOF;
 		$zip = new \ZipArchive;
 		$zipState = $zip->open($downloadedFilePath);
 		if ($zipState === true) {
-			$zip->extractTo(dirname($downloadedFilePath));
+			$extraction = $zip->extractTo(dirname($downloadedFilePath));
+			if($extraction === false) {
+				throw new \Exception('Error during unpacking zipfile: '.($zip->getStatusString()));
+			}
 			$zip->close();
 			$state = unlink($downloadedFilePath);
 			if($state === false) {
-				throw new \Exception('Cant unlink '. $downloadedFilePath);
+				throw new \Exception("Can't unlink ". $downloadedFilePath);
 			}
 		} else {
-			throw new \Exception('Cant handle ZIP file. Error code is: '.$zipState);
+			throw new \Exception("Can't handle ZIP file. Error code is: ".$zipState);
 		}
 
 		// Ensure that the downloaded version is not lower
@@ -672,10 +768,27 @@ EOF;
 			\RecursiveIteratorIterator::CHILD_FIRST
 		);
 
+		$directories = array();
+		$files = array();
 		foreach ($iterator as $fileInfo) {
-			$action = $fileInfo->isDir() ? 'rmdir' : 'unlink';
-			$action($fileInfo->getRealPath());
+			if ($fileInfo->isDir()) {
+				$directories[] = $fileInfo->getRealPath();
+			} else {
+				if ($fileInfo->isLink()) {
+					$files[] = $fileInfo->getPathName();
+				} else {
+					$files[] = $fileInfo->getRealPath();
+				}
+			}
 		}
+
+		foreach ($files as $file) {
+			unlink($file);
+		}
+		foreach ($directories as $dir) {
+			rmdir($dir);
+		}
+
 		$state = rmdir($folder);
 		if($state === false) {
 			throw new \Exception('Could not rmdir ' . $folder);
@@ -694,9 +807,18 @@ EOF;
 		if(!file_exists($shippedAppsFile)) {
 			throw new \Exception('core/shipped.json is not available');
 		}
+
+		$newShippedAppsFile = $this->getDataDirectoryLocation() . '/updater-'.$this->getConfigOption('instanceid') . '/downloads/nextcloud/core/shipped.json';
+		if(!file_exists($newShippedAppsFile)) {
+			throw new \Exception('core/shipped.json is not available in the new release');
+		}
+
 		// Delete shipped apps
-		$shippedApps = json_decode(file_get_contents($shippedAppsFile), true);
-		foreach($shippedApps['shippedApps'] as $app) {
+		$shippedApps = array_merge(
+			json_decode(file_get_contents($shippedAppsFile), true)['shippedApps'],
+			json_decode(file_get_contents($newShippedAppsFile), true)['shippedApps']
+		);
+		foreach($shippedApps as $app) {
 			$this->recursiveDelete($this->baseDir . '/../apps/' . $app);
 		}
 
@@ -713,7 +835,7 @@ EOF;
 
 		$themesReadme = $this->baseDir . '/../themes/README';
 		if(file_exists($themesReadme)) {
-			$this->silentLog('[info] thmes README exists');
+			$this->silentLog('[info] themes README exists');
 
 			// Delete themes
 			$state = unlink($themesReadme);
@@ -725,6 +847,7 @@ EOF;
 
 		// Delete the rest
 		$excludedElements = [
+			'.well-known',
 			'data',
 			'index.php',
 			'status.php',
@@ -737,6 +860,7 @@ EOF;
 			'apps',
 			'updater',
 		];
+		$excludedElements = array_merge($excludedElements, $this->getAppDirectories());
 		/**
 		 * @var string $path
 		 * @var \SplFileInfo $fileInfo
@@ -755,7 +879,7 @@ EOF;
 					continue;
 				}
 			}
-			if($fileInfo->isFile()) {
+			if($fileInfo->isFile() || $fileInfo->isLink()) {
 				$state = unlink($path);
 				if($state === false) {
 					throw new \Exception('Could not unlink: '.$path);
@@ -869,6 +993,12 @@ EOF;
 		if($state === false) {
 			throw new \Exception('Could not rmdir .step');
 		}
+
+		if (function_exists('opcache_reset')) {
+			$this->silentLog('[info] call opcache_reset()');
+			opcache_reset();
+		}
+
 		$this->silentLog('[info] end of finalize()');
 	}
 

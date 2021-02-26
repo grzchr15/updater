@@ -2,6 +2,7 @@
 /**
  * @copyright Copyright (c) 2016-2017 Lukas Reschke <lukas@statuscode.ch>
  * @copyright Copyright (c) 2016 Morris Jobke <hey@morrisjobke.de>
+ * @copyright Copyright (c) 2018 Jonas Sulzer <jonas@violoncello.ch>
  *
  * @license GNU AGPL version 3 or any later version
  *
@@ -39,10 +40,12 @@ class RecursiveDirectoryIteratorWithoutData extends \RecursiveFilterIterator {
 	public function accept() {
 		/** @var \DirectoryIterator $this */
 		$excludes = [
+			'.rnd',
+			'.well-known',
 			'data',
 			'..',
 		];
-		return !(in_array($this->getFilename(), $excludes, true) || $this->isDir());
+		return !(in_array($this->current()->getFilename(), $excludes, true) || $this->current()->isDir());
 	}
 }
 
@@ -150,6 +153,8 @@ class Updater {
 	private $updateAvailable = false;
 	/** @var string */
 	private $requestID = null;
+	/** @var bool */
+	private $disabled = false;
 
 	/**
 	 * Updater constructor
@@ -171,6 +176,12 @@ class Updater {
 		/** @var array $CONFIG */
 		require_once $configFileName;
 		$this->configValues = $CONFIG;
+
+		if (php_sapi_name() !== 'cli' && ($this->configValues['upgrade.disable-web'] ?? false)) {
+			// updater disabled
+			$this->disabled = true;
+			return;
+		}
 
 		$dataDir = $this->getDataDirectoryLocation();
 		if(empty($dataDir) || !is_string($dataDir)) {
@@ -208,6 +219,15 @@ class Updater {
 	}
 
 	/**
+	 * Returns whether the web updater is disabled
+	 *
+	 * @return bool
+	 */
+	public function isDisabled() {
+		return $this->disabled;
+	}
+
+	/**
 	 * Returns current version or "unknown" if this could not be determined.
 	 *
 	 * @return string
@@ -241,6 +261,12 @@ class Updater {
 			$this->updateAvailable = true;
 			$releaseChannel = $this->getCurrentReleaseChannel();
 			$updateText = 'Update to ' . htmlentities($versionString) . ' available. (channel: "' . htmlentities($releaseChannel) . '")<br /><span class="light">Following file will be downloaded automatically:</span> <code class="light">' . $response['url'] . '</code>';
+
+			// only show changelog link for stable releases (non-RC & non-beta)
+			if (!preg_match('!(rc|beta)!i', $versionString)) {
+				$changelogURL = $this->getChangelogURL(substr($version, 0, strrpos($version, '.')));
+				$updateText .= '<br /><a class="external_link" href="' . $changelogURL . '" target="_blank" rel="noreferrer noopener">Open changelog ↗</a>';
+			}
 		} else {
 			$updateText = 'No update available.';
 		}
@@ -289,11 +315,12 @@ class Updater {
 	 * @return array
 	 */
 	private function getExpectedElementsList() {
-		return [
+		$expected = [
 			// Generic
 			'.',
 			'..',
 			// Folders
+			'.well-known',
 			'3rdparty',
 			'apps',
 			'config',
@@ -303,11 +330,13 @@ class Updater {
 			'lib',
 			'ocs',
 			'ocs-provider',
+			'ocm-provider',
 			'resources',
 			'settings',
 			'themes',
 			'updater',
 			// Files
+			'.rnd',
 			'index.html',
 			'indie.json',
 			'.user.ini',
@@ -327,6 +356,26 @@ class Updater {
 			'occ',
 			'db_structure.xml',
 		];
+		return array_merge($expected, $this->getAppDirectories());
+	}
+
+	/**
+	 * Returns app directories specified in config.php
+	 *
+	 * @return array
+	 */
+	private function getAppDirectories() {
+		$expected = [];
+		if($appsPaths = $this->getConfigOption('apps_paths')) {
+			foreach ($appsPaths as $appsPath) {
+				$parentDir = realpath($this->baseDir . '/../');
+				$appDir = basename($appsPath['path']);
+				if(strpos($appsPath['path'], $parentDir) === 0 && $appDir !== 'apps') {
+					$expected[] = $appDir;
+				}
+			}
+		}
+		return $expected;
 	}
 
 	/**
@@ -431,16 +480,15 @@ class Updater {
 		$this->silentLog('[info] createBackup()');
 
 		$excludedElements = [
+			'.rnd',
+			'.well-known',
 			'data',
 		];
 
 		// Create new folder for the backup
-		$backupFolderLocation = $this->getDataDirectoryLocation() . '/updater-'.$this->getConfigOption('instanceid').'/backups/nextcloud-'.$this->getConfigOption('version') . '/';
-		if(file_exists($backupFolderLocation)) {
-			$this->silentLog('[info] backup folder location exists');
+		$backupFolderLocation = $this->getDataDirectoryLocation() . '/updater-'.$this->getConfigOption('instanceid').'/backups/nextcloud-'.$this->getConfigOption('version') . '-' . time() . '/';
+		$this->silentLog('[info] backup folder location: ' . $backupFolderLocation);
 
-			$this->recursiveDelete($backupFolderLocation);
-		}
 		$state = mkdir($backupFolderLocation, 0750, true);
 		if($state === false) {
 			throw new \Exception('Could not create backup folder location');
@@ -480,17 +528,40 @@ class Updater {
 			if($fileInfo->isFile()) {
 				$state = copy($fileInfo->getRealPath(), $backupFolderLocation . $fileName);
 				if($state === false) {
-					throw new \Exception(
-						sprintf(
-							'Could not copy "%s" to "%s"',
-							$fileInfo->getRealPath(),
-							$backupFolderLocation . $fileName
-						)
+					$message = sprintf(
+						'Could not copy "%s" to "%s"',
+						$fileInfo->getRealPath(),
+						$backupFolderLocation . $fileName
 					);
+
+					if(is_readable($fileInfo->getRealPath()) === false) {
+						$message = sprintf(
+							'%s. Source %s is not readable',
+							$message,
+							$fileInfo->getRealPath()
+						);
+					}
+
+					if(is_writable($backupFolderLocation . $fileName) === false) {
+						$message = sprintf(
+							'%s. Destination %s is not writable',
+							$message,
+							$backupFolderLocation . $fileName
+						);
+					}
+
+					throw new \Exception($message);
 				}
 			}
 		}
 		$this->silentLog('[info] end of createBackup()');
+	}
+
+	private function getChangelogURL($versionString) {
+		$this->silentLog('[info] getChangelogURL()');
+		$changelogWebsite = 'https://nextcloud.com/changelog/';
+		$changelogURL = $changelogWebsite . '#' . str_replace('.', '-', $versionString);
+		return $changelogURL;
 	}
 
 	/**
@@ -503,7 +574,7 @@ class Updater {
 		$updaterServer = $this->getConfigOption('updater.server.url');
 		if($updaterServer === null) {
 			// FIXME: used deployed URL
-			$updaterServer = 'https://updates.nextcloud.org/updater_server/';
+			$updaterServer = 'https://updates.nextcloud.com/updater_server/';
 		}
 		$this->silentLog('[info] updaterServer: ' . $updaterServer);
 
@@ -521,6 +592,15 @@ class Updater {
 			CURLOPT_URL => $updateURL,
 			CURLOPT_USERAGENT => 'Nextcloud Updater',
 		]);
+
+		if ($this->getConfigOption('proxy') !== null) {
+			curl_setopt_array($curl, [
+				CURLOPT_PROXY => $this->getConfigOption('proxy'),
+				CURLOPT_PROXYUSERPWD => $this->getConfigOption('proxyuserpwd'),
+				CURLOPT_HTTPPROXYTUNNEL => $this->getConfigOption('proxy') ? 1 : 0,
+			]);
+		}
+
 		$response = curl_exec($curl);
 		if($response === false) {
 			throw new \Exception('Could not do request to updater server: '.curl_error($curl));
@@ -569,7 +649,19 @@ class Updater {
 
 		$fp = fopen($storageLocation . basename($response['url']), 'w+');
 		$ch = curl_init($response['url']);
-		curl_setopt($ch, CURLOPT_FILE, $fp);
+		curl_setopt_array($ch, [
+			CURLOPT_FILE => $fp,
+			CURLOPT_USERAGENT => 'Nextcloud Updater',
+		]);
+
+		if ($this->getConfigOption('proxy') !== null) {
+			curl_setopt_array($ch, [
+				CURLOPT_PROXY => $this->getConfigOption('proxy'),
+				CURLOPT_PROXYUSERPWD => $this->getConfigOption('proxyuserpwd'),
+				CURLOPT_HTTPPROXYTUNNEL => $this->getConfigOption('proxy') ? 1 : 0,
+			]);
+		}
+
 		if(curl_exec($ch) === false) {
 			throw new \Exception('Curl error: ' . curl_error($ch));
 		}
@@ -616,12 +708,15 @@ class Updater {
 		$storageLocation = $this->getDataDirectoryLocation() . '/updater-'.$this->getConfigOption('instanceid') . '/downloads/';
 		$this->silentLog('[info] storage location: ' . $storageLocation);
 
-		$files = scandir($storageLocation);
-		// ., .. and downloaded zip archive
-		if(count($files) !== 3) {
-			throw new \Exception('Not exact 3 files existent in folder');
+		$filesInStorageLocation = scandir($storageLocation);
+		$files = array_values(array_filter($filesInStorageLocation, function($path){
+			return $path !== '.' && $path !== '..';
+		}));
+		// only the downloaded archive
+		if(count($files) !== 1) {
+			throw new \Exception('There are more files than the downloaded archive in the downloads/ folder.');
 		}
-		return $storageLocation . '/' . $files[2];
+		return $storageLocation . '/' . $files[0];
 	}
 
 	/**
@@ -716,14 +811,17 @@ EOF;
 		$zip = new \ZipArchive;
 		$zipState = $zip->open($downloadedFilePath);
 		if ($zipState === true) {
-			$zip->extractTo(dirname($downloadedFilePath));
+			$extraction = $zip->extractTo(dirname($downloadedFilePath));
+			if($extraction === false) {
+				throw new \Exception('Error during unpacking zipfile: '.($zip->getStatusString()));
+			}
 			$zip->close();
 			$state = unlink($downloadedFilePath);
 			if($state === false) {
-				throw new \Exception('Cant unlink '. $downloadedFilePath);
+				throw new \Exception("Can't unlink ". $downloadedFilePath);
 			}
 		} else {
-			throw new \Exception('Cant handle ZIP file. Error code is: '.$zipState);
+			throw new \Exception("Can't handle ZIP file. Error code is: ".$zipState);
 		}
 
 		// Ensure that the downloaded version is not lower
@@ -787,10 +885,27 @@ EOF;
 			\RecursiveIteratorIterator::CHILD_FIRST
 		);
 
+		$directories = array();
+		$files = array();
 		foreach ($iterator as $fileInfo) {
-			$action = $fileInfo->isDir() ? 'rmdir' : 'unlink';
-			$action($fileInfo->getRealPath());
+			if ($fileInfo->isDir()) {
+				$directories[] = $fileInfo->getRealPath();
+			} else {
+				if ($fileInfo->isLink()) {
+					$files[] = $fileInfo->getPathName();
+				} else {
+					$files[] = $fileInfo->getRealPath();
+				}
+			}
 		}
+
+		foreach ($files as $file) {
+			unlink($file);
+		}
+		foreach ($directories as $dir) {
+			rmdir($dir);
+		}
+
 		$state = rmdir($folder);
 		if($state === false) {
 			throw new \Exception('Could not rmdir ' . $folder);
@@ -809,9 +924,18 @@ EOF;
 		if(!file_exists($shippedAppsFile)) {
 			throw new \Exception('core/shipped.json is not available');
 		}
+
+		$newShippedAppsFile = $this->getDataDirectoryLocation() . '/updater-'.$this->getConfigOption('instanceid') . '/downloads/nextcloud/core/shipped.json';
+		if(!file_exists($newShippedAppsFile)) {
+			throw new \Exception('core/shipped.json is not available in the new release');
+		}
+
 		// Delete shipped apps
-		$shippedApps = json_decode(file_get_contents($shippedAppsFile), true);
-		foreach($shippedApps['shippedApps'] as $app) {
+		$shippedApps = array_merge(
+			json_decode(file_get_contents($shippedAppsFile), true)['shippedApps'],
+			json_decode(file_get_contents($newShippedAppsFile), true)['shippedApps']
+		);
+		foreach($shippedApps as $app) {
 			$this->recursiveDelete($this->baseDir . '/../apps/' . $app);
 		}
 
@@ -828,7 +952,7 @@ EOF;
 
 		$themesReadme = $this->baseDir . '/../themes/README';
 		if(file_exists($themesReadme)) {
-			$this->silentLog('[info] thmes README exists');
+			$this->silentLog('[info] themes README exists');
 
 			// Delete themes
 			$state = unlink($themesReadme);
@@ -840,6 +964,7 @@ EOF;
 
 		// Delete the rest
 		$excludedElements = [
+			'.well-known',
 			'data',
 			'index.php',
 			'status.php',
@@ -852,6 +977,7 @@ EOF;
 			'apps',
 			'updater',
 		];
+		$excludedElements = array_merge($excludedElements, $this->getAppDirectories());
 		/**
 		 * @var string $path
 		 * @var \SplFileInfo $fileInfo
@@ -870,7 +996,7 @@ EOF;
 					continue;
 				}
 			}
-			if($fileInfo->isFile()) {
+			if($fileInfo->isFile() || $fileInfo->isLink()) {
 				$state = unlink($path);
 				if($state === false) {
 					throw new \Exception('Could not unlink: '.$path);
@@ -984,6 +1110,12 @@ EOF;
 		if($state === false) {
 			throw new \Exception('Could not rmdir .step');
 		}
+
+		if (function_exists('opcache_reset')) {
+			$this->silentLog('[info] call opcache_reset()');
+			opcache_reset();
+		}
+
 		$this->silentLog('[info] end of finalize()');
 	}
 
@@ -1164,8 +1296,13 @@ ini_set('log_errors', '1');
 // Check if the config.php is at the expected place
 try {
 	$updater = new Updater(__DIR__);
+	if ($updater->isDisabled()) {
+		http_response_code(403);
+		die('Updater is disabled, please use the command line');
+	}
 } catch (\Exception $e) {
 	// logging here is not possible because we don't know the data directory
+	http_response_code(500);
 	die($e->getMessage());
 }
 
@@ -1184,7 +1321,7 @@ try {
 }
 
 // Check for authentication
-$password = isset($_SERVER['HTTP_X_UPDATER_AUTH']) ? $_SERVER['HTTP_X_UPDATER_AUTH'] : '';
+$password = isset($_SERVER['HTTP_X_UPDATER_AUTH']) ? $_SERVER['HTTP_X_UPDATER_AUTH'] : (isset($_POST['updater-secret-input']) ? $_POST['updater-secret-input'] : '');
 $auth = new Auth($updater, $password);
 
 // Check if already a step is in process
@@ -1227,19 +1364,19 @@ if(isset($_POST['step'])) {
 				$updater->checkWritePermissions();
 				break;
 			case 3:
-				$updater->setMaintenanceMode(true);
-				break;
-			case 4:
 				$updater->createBackup();
 				break;
-			case 5:
+			case 4:
 				$updater->downloadUpdate();
 				break;
-			case 6:
+			case 5:
 				$updater->verifyIntegrity();
 				break;
-			case 7:
+			case 6:
 				$updater->extractDownload();
+				break;
+			case 7:
+				$updater->setMaintenanceMode(true);
 				break;
 			case 8:
 				$updater->replaceEntryPoints();
@@ -1330,6 +1467,9 @@ if(strpos($updaterUrl, 'index.php') === false) {
 			color: #000;
 			text-decoration: none;
 			cursor: pointer;
+		}
+		.external_link {
+			text-decoration: underline;
 		}
 		ul {
 			list-style: none;
@@ -1454,8 +1594,39 @@ if(strpos($updaterUrl, 'index.php') === false) {
 			opacity: 1;
 		}
 
-		li.current-step h2 {
-			background-image: url(data:image/gif;base64,R0lGODlhEAAQAOMAAP///zMzM9HR0ZycnMTExK6url5eXnd3d9/f3+np6cnJyUpKSjY2Nv///////////yH/C05FVFNDQVBFMi4wAwEAAAAh+QQJCgAPACwAAAAAEAAQAAAETvDJ+UqhWA7JmCSZtIDdo4ChsTwlkWDG9Szb9yQEehgGkuUKGCpE/AEHyJqRECxKfBjEkJJ7fZhRycmHkwhA4CmG4EORQyfb4xuyPsSSCAAh+QQJCgAPACwAAAAAEAAQAAAEUvDJ+QqhWBa5lmSZZChPV4LhYZQLwmzUQD7GMIEJcT3EMCQZ3WwyEISORx1BoVAmhcgJIoPYYXRAic5ImT6a05xEcClbg9MdwYtpasfnSZYXigAAIfkECQoADwAsAAAAABAAEAAABFDwyfkIoVgqaYxcmTQgT1eCYTGURrJcTyIR5DPAD1gwjCRYMgwPNaGFaqGMhaBQLJPLTXKCpOIowCJBgKk5SQnYr1K5YowwY8Y585klQXImAgAh+QQJCgAPACwAAAAAEAAQAAAEUPDJ+YSgWCI5hjSZRCRP9xxgqBDlkBjsQz7ERtsPSCyLJBCjDC81qYVmoQxjuVgBk0tGLznBVWMYIBJ4odhWm0TsR6NhM8aYMbMS+c6TbSgCACH5BAkKAA8ALAAAAAAQABAAAARQ8Mn5EKJY3leKHJlEJJw3gKFClMmwkQ+xyRNIGIYkEGOGHxhaBhbKLI4GFa94XOSKtQxilWEwPCKCALNZMEAJ6i4Wo4ZoVCFGJdKZKcT3JAIAIfkECQoADwAsAAAAABAAEAAABFDwyflSolgiSYgsGXd1DwGGitclxVZxLuGWDzIMkrBmN07JoUsoZCgeUiSicUjxURCezGIRLREEmAHWsMAlojoag8EERhlOSoojMZAzQlomAgAh+QQJCgAPACwAAAAAEAAQAAAEUPDJ+VKiWCJJCM/c1T2KB5ZPlxBXxW0pnFbjI6hZp2CETLWgzGBYKNWExCBlkEGYMAbDsyPAFKoHQ4EmuT0Yj8VC2ftKFswMyvw4jDNAcCYCACH5BAkKAA8ALAAAAAAQABAAAARQ8Mn5UqJYIkkIz9zVPYoHlk+XEFfFbSmcVuMjqFmnYIRMtaCcrlQTEnbBiYmCWFIGA1lHwNtAdyuJgfFYPAyGJGPQ1RZAC275cQhnzhJvJgIAIfkECQoADwAsAAAAABAAEAAABFHwyflSolgiSQjP3NU9igeWT5cQV8VtKZxW4yOoWadghEy1oJyuVBMSdsGJTzJggHASBsOAEVxKm4LzcVg8qINBciGmPgZIjMH7lRTEuYkZEwEAIfkECQoADwAsAAAAABAAEAAABE/wyflSolgiSQjP3NU9igeWT5cQV8VtKZxW4yOoWadghEy1oJyOQWQEO4RdcOKTDBYgnGSxOGAQl9KGAH0cDI9BygQyFMKvMhhtI1PI4kwEACH5BAkKAA8ALAAAAAAQABAAAARQ8Mn5UqJYIkkIz9zVPYoHlk+XEFclMQO3fatpMIyQdQoGgy3QjofDCTuEnnAyoxQMINXEYDhgEJfShgB9FGKekXDQMxGalEEsJRGYrpM3JQIAIfkEAQoADwAsAAAAABAAEAAABFHwyflSolgOSQjPEuN1j+KBC/N0CXFV0rI9zDF57XksC5J1CsyiAHqBfkCD0nDsEILHiQ+jmGFYk8GASEFcTD7ETDBanUAE3ykNMn0e5OINFAEAOw==);
+		.current-step {
+			background-repeat: no-repeat;
+			background-position: center;
+			min-width: 16px;
+			min-height: 16px;
+			position: relative;
+		}
+		.current-step:after {
+			z-index: 2;
+			content: '';
+			height: 12px;
+			width: 12px;
+			margin: -8px 0 0 -8px;
+			position: absolute;
+			top: 14px;
+			left: 16px;
+			border-radius: 100%;
+			-webkit-animation: rotate .8s infinite linear;
+			animation: rotate .8s infinite linear;
+			-webkit-transform-origin: center;
+			-ms-transform-origin: center;
+			transform-origin: center;
+			border: 2px solid rgba(150, 150, 150, 0.5);
+			border-top-color: #969696;
+		}
+
+		@keyframes rotate {
+			from {
+				transform: rotate(0deg);
+			}
+			to {
+				transform: rotate(360deg);
+			}
 		}
 
 		li.current-step h2, li.passed-step h2, li.failed-step h2, li.waiting-step h2 {
@@ -1464,15 +1635,16 @@ if(strpos($updaterUrl, 'index.php') === false) {
 		}
 
 		li.passed-step h2 {
-			background-image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAMAAAAoLQ9TAAAAWlBMVEUAAAAAqgAAvwAA1QAA3wAAxgAA0QAA1QAAzgAA0QAA1gAA1gAA1wAA1gAA0gAA1QAA1AAA1AAA1AAA1QAA0wAA1AAA1AAA1QAA0wAA1AAA1AAA1QAA1AAA1ACEAd/9AAAAHXRSTlMAAwQGCAkLDBUWGR8gLC2osrO3uru9v9LT1Nfq+K5OpOQAAABPSURBVBiVpYq3EYAwEMBEfnJONr//mhSYI5SgTifBPyLv5UPtP11tAZDI4b3aEiCeTAYErdoKAFl0TQk71wGZ1eTN2d2zXd09tw4gY8l3dg+HBDK71PO7AAAAAElFTkSuQmCC);
+			background-image: url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGhlaWdodD0iMTYiIHdpZHRoPSIxNiIgdmVyc2lvbj0iMS4xIiB2aWV3Qm94PSIwIDAgMTYgMTYiPjxwYXRoIGQ9Im0yLjM1IDcuMyA0IDRsNy4zLTcuMyIgc3Ryb2tlPSIjNDZiYTYxIiBzdHJva2Utd2lkdGg9IjIiIGZpbGw9Im5vbmUiLz48L3N2Zz4NCg==);
 		}
 
 		li.failed-step {
 			background-color: #ffd4d4;
+			border-radius: 3px;
 		}
 		li.failed-step h2 {
 			color: #000;
-			background-image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAMAAAAoLQ9TAAAAPFBMVEUAAACqAADMAADVAADVAADVAADVAADWAADWAADUAADUAADUAADVAADUAADTAADVAADUAADVAADUAADUAACCP69rAAAAE3RSTlMAAwUGDCorMjiHpaeosdPk6ervRw2uZQAAAERJREFUeAFjIA4w8QoDgRA7jM/ILQwGgmxQPheQw8HAJywswAoW4BSGCQjzM4MEeBACwizECiAAC4ah6NZiOgzT6YQBABtYB8QyiY2BAAAAAElFTkSuQmCC);
+			background-image: url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGhlaWdodD0iMTYiIHdpZHRoPSIxNiIgdmVyc2lvbj0iMS4xIiB2aWV3Ym94PSIwIDAgMTYgMTYiPjxwYXRoIGQ9Im0xNCAxMi4zLTEuNyAxLjctNC4zLTQuMy00LjMgNC4zLTEuNy0xLjcgNC4zLTQuMy00LjMtNC4zIDEuNy0xLjcgNC4zIDQuMyA0LjMtNC4zIDEuNyAxLjctNC4zIDQuM3oiIGZpbGw9IiNkNDAwMDAiLz48L3N2Zz4NCg==);
 		}
 
 		li.step .output {
@@ -1491,19 +1663,20 @@ if(strpos($updaterUrl, 'index.php') === false) {
 			font-family: 'Open Sans', Frutiger, Calibri, 'Myriad Pro', Myriad, sans-serif;
 			font-size: 13px;
 			font-weight: 600;
-			color: #555;
+			color: #545454;
 			margin: 3px 3px 3px 0;
-			padding: 5px;
-			background-color: rgba(255, 255, 255, .95);
+			padding: 6px 12px;
+			background-color: #f7f7f7;
 			border-radius: 3px;
-			border: 1px solid rgba(240,240,240,.9);
+			border: 1px solid #dbdbdb;
 			cursor: pointer;
 			outline: none;
+			min-height: 34px;
+			box-sizing: border-box;
 		}
 
 		button:hover, button:focus, a.button:hover, a.button:focus {
-			background-color: rgba(240,240,240,.9);
-			color: #111;
+			border-color: #0082c9;
 		}
 
 		code {
@@ -1524,9 +1697,22 @@ if(strpos($updaterUrl, 'index.php') === false) {
 		}
 
 		#login input {
-			padding: 5px;
 			border-radius: 3px;
 			border: 1px solid rgba(240,240,240,.9);
+			margin: 3px 3px 3px 0;
+			padding: 9px 6px;
+			font-size: 13px;
+			outline: none;
+			cursor: text;
+		}
+
+		.section {
+			max-width: 600px;
+			margin: 0 auto;
+		}
+
+		pre {
+			word-wrap: break-word;
 		}
 
 	</style>
@@ -1542,11 +1728,6 @@ if(strpos($updaterUrl, 'index.php') === false) {
 <div id="content-wrapper">
 	<div id="content">
 
-		<div id="app-navigation">
-			<ul>
-				<li><a href="#progress">Update</a></li>
-			</ul>
-		</div>
 		<div id="app-content">
 		<?php if($auth->isAuthenticated()): ?>
 			<ul id="progress" class="section">
@@ -1577,24 +1758,24 @@ if(strpos($updaterUrl, 'index.php') === false) {
 					<h2>Check for write permissions</h2>
 					<div class="output hidden"></div>
 				</li>
-				<li id="step-enable-maintenance" class="step <?php if($stepNumber >= 3) { echo 'passed-step'; }?>">
-					<h2>Enable maintenance mode</h2>
-					<div class="output hidden"></div>
-				</li>
-				<li id="step-backup" class="step <?php if($stepNumber >= 4) { echo 'passed-step'; }?>">
+				<li id="step-backup" class="step <?php if($stepNumber >= 3) { echo 'passed-step'; }?>">
 					<h2>Create backup</h2>
 					<div class="output hidden"></div>
 				</li>
-				<li id="step-download" class="step <?php if($stepNumber >= 5) { echo 'passed-step'; }?>">
+				<li id="step-download" class="step <?php if($stepNumber >= 4) { echo 'passed-step'; }?>">
 					<h2>Downloading</h2>
 					<div class="output hidden"></div>
 				</li>
-				<li id="step-verify-integrity" class="step <?php if($stepNumber >= 6) { echo 'passed-step'; }?>">
+				<li id="step-verify-integrity" class="step <?php if($stepNumber >= 5) { echo 'passed-step'; }?>">
 					<h2>Verifying integrity</h2>
 					<div class="output hidden"></div>
 				</li>
-				<li id="step-extract" class="step <?php if($stepNumber >= 7) { echo 'passed-step'; }?>">
+				<li id="step-extract" class="step <?php if($stepNumber >= 6) { echo 'passed-step'; }?>">
 					<h2>Extracting</h2>
+					<div class="output hidden"></div>
+				</li>
+				<li id="step-enable-maintenance" class="step <?php if($stepNumber >= 7) { echo 'passed-step'; }?>">
+					<h2>Enable maintenance mode</h2>
 					<div class="output hidden"></div>
 				</li>
 				<li id="step-entrypoints" class="step <?php if($stepNumber >= 8) { echo 'passed-step'; }?>">
@@ -1619,7 +1800,7 @@ if(strpos($updaterUrl, 'index.php') === false) {
 				<li id="step-done" class="step <?php if($stepNumber >= 12) { echo 'passed-step'; }?>">
 					<h2>Done</h2>
 					<div class="output hidden">
-						<a class="button" href="<?php echo str_replace('/index.php', '/../', $updaterUrl); ?>">Go back to your Nextcloud instance to finish the update</a>
+						<a class="button" href="<?php echo htmlspecialchars(str_replace('/index.php', '/../', $updaterUrl), ENT_QUOTES); ?>">Go back to your Nextcloud instance to finish the update</a>
 					</div>
 				</li>
 			</ul>
@@ -1632,13 +1813,13 @@ if(strpos($updaterUrl, 'index.php') === false) {
 				<code>php -r '$password = trim(shell_exec("openssl rand -base64 48"));if(strlen($password) === 64) {$hash = password_hash($password, PASSWORD_DEFAULT) . "\n"; echo "Insert as \"updater.secret\": ".$hash; echo "The plaintext value is: ".$password."\n";}else{echo "Could not execute OpenSSL.\n";};'</code>
 				<form method="post" name="login">
 					<fieldset>
-						<input type="password" id="updater-secret-input" value=""
+						<input type="password" name="updater-secret-input" value=""
 							   placeholder="Secret"
 							   autocomplete="on" required>
 						<button id="updater-secret-submit">Login</button>
 					</fieldset>
 				</form>
-				<?php if(isset($_SERVER['HTTP_X_UPDATER_AUTH']) && !$auth->isAuthenticated()): ?>
+				<?php if(isset($_POST['updater-secret-input']) && !$auth->isAuthenticated()): ?>
 				<p>Invalid password</p>
 				<?php endif; ?>
 			</div>
@@ -1733,7 +1914,8 @@ if(strpos($updaterUrl, 'index.php') === false) {
 					// it seems that this is not a JSON object
 					var response = {
 						processed: false,
-						response: 'Parsing response failed. ' + httpRequest.responseText
+						response: 'Parsing response failed.',
+						detailedResponseText: httpRequest.responseText,
 					};
 					callback(response);
 				} else {
@@ -1762,6 +1944,8 @@ if(strpos($updaterUrl, 'index.php') === false) {
 					var text = '';
 					if (typeof response['response'] === 'string') {
 						text = escapeHTML(response['response']);
+						text += '<br><details><summary>Show detailed response</summary><pre><code>' +
+							escapeHTML(response['detailedResponseText']) + '</code></pre></details>';
 					} else {
 						text = 'The following extra files have been found:<ul>';
 						response['response'].forEach(function(file) {
@@ -1775,7 +1959,7 @@ if(strpos($updaterUrl, 'index.php') === false) {
 			2: function(response) {
 				if(response.proceed === true) {
 					successStep('step-check-permissions');
-					currentStep('step-enable-maintenance');
+					currentStep('step-backup');
 					performStep(3, performStepCallbacks[3]);
 				} else {
 					errorStep('step-check-permissions', 2);
@@ -1783,6 +1967,8 @@ if(strpos($updaterUrl, 'index.php') === false) {
 					var text = '';
 					if (typeof response['response'] === 'string') {
 						text = escapeHTML(response['response']);
+						text += '<br><details><summary>Show detailed response</summary><pre><code>' +
+							escapeHTML(response['detailedResponseText']) + '</code></pre></details>';
 					} else {
 						text = 'The following places can not be written to:<ul>';
 						response['response'].forEach(function(file) {
@@ -1793,68 +1979,83 @@ if(strpos($updaterUrl, 'index.php') === false) {
 					addStepText('step-check-permissions', text);
 				}
 			},
-			3: function(response) {
-				if(response.proceed === true) {
-					successStep('step-enable-maintenance');
-					currentStep('step-backup');
+			3: function (response) {
+				if (response.proceed === true) {
+					successStep('step-backup');
+					currentStep('step-download');
 					performStep(4, performStepCallbacks[4]);
 				} else {
-					errorStep('step-enable-maintenance', 3);
+					errorStep('step-backup', 3);
 
 					if(response.response) {
-						addStepText('step-enable-maintenance', escapeHTML(response.response));
+						var text = escapeHTML(response.response);
+						text += '<br><details><summary>Show detailed response</summary><pre><code>' +
+							escapeHTML(response.detailedResponseText) + '</code></pre></details>';
+						addStepText('step-backup', text);
 					}
 				}
 			},
 			4: function (response) {
 				if (response.proceed === true) {
-					successStep('step-backup');
-					currentStep('step-download');
+					successStep('step-download');
+					currentStep('step-verify-integrity');
 					performStep(5, performStepCallbacks[5]);
 				} else {
-					errorStep('step-backup', 4);
+					errorStep('step-download', 4);
 
 					if(response.response) {
-						addStepText('step-backup', escapeHTML(response.response));
+						var text = escapeHTML(response.response);
+						text += '<br><details><summary>Show detailed response</summary><pre><code>' +
+							escapeHTML(response.detailedResponseText) + '</code></pre></details>';
+						addStepText('step-download', text);
 					}
 				}
 			},
 			5: function (response) {
 				if (response.proceed === true) {
-					successStep('step-download');
-					currentStep('step-verify-integrity');
+					successStep('step-verify-integrity');
+					currentStep('step-extract');
 					performStep(6, performStepCallbacks[6]);
 				} else {
 					errorStep('step-verify-integrity', 5);
 
 					if(response.response) {
-						addStepText('step-verify-integrity', escapeHTML(response.response));
+						var text = escapeHTML(response.response);
+						text += '<br><details><summary>Show detailed response</summary><pre><code>' +
+							escapeHTML(response.detailedResponseText) + '</code></pre></details>';
+						addStepText('step-verify-integrity', text);
 					}
 				}
 			},
 			6: function (response) {
 				if (response.proceed === true) {
-					successStep('step-verify-integrity');
-					currentStep('step-extract');
+					successStep('step-extract');
+					currentStep('step-enable-maintenance');
 					performStep(7, performStepCallbacks[7]);
 				} else {
-					errorStep('step-verify-integrity', 6);
+					errorStep('step-extract', 6);
 
 					if(response.response) {
-						addStepText('step-verify-integrity', escapeHTML(response.response));
+						var text = escapeHTML(response.response);
+						text += '<br><details><summary>Show detailed response</summary><pre><code>' +
+							escapeHTML(response.detailedResponseText) + '</code></pre></details>';
+						addStepText('step-extract', text);
 					}
 				}
 			},
 			7: function (response) {
 				if (response.proceed === true) {
-					successStep('step-extract');
+					successStep('step-enable-maintenance');
 					currentStep('step-entrypoints');
 					performStep(8, performStepCallbacks[8]);
 				} else {
-					errorStep('step-extract', 7);
+					errorStep('step-enable-maintenance', 7);
 
 					if(response.response) {
-						addStepText('step-extract', escapeHTML(response.response));
+						var text = escapeHTML(response.response);
+						text += '<br><details><summary>Show detailed response</summary><pre><code>' +
+							escapeHTML(response.detailedResponseText) + '</code></pre></details>';
+						addStepText('step-enable-maintenance', text);
 					}
 				}
 			},
@@ -1867,7 +2068,10 @@ if(strpos($updaterUrl, 'index.php') === false) {
 					errorStep('step-entrypoints', 8);
 
 					if(response.response) {
-						addStepText('step-entrypoints', escapeHTML(response.response));
+						var text = escapeHTML(response.response);
+						text += '<br><details><summary>Show detailed response</summary><pre><code>' +
+							escapeHTML(response.detailedResponseText) + '</code></pre></details>';
+						addStepText('step-entrypoints', text);
 					}
 				}
 			},
@@ -1880,7 +2084,10 @@ if(strpos($updaterUrl, 'index.php') === false) {
 					errorStep('step-delete', 9);
 
 					if(response.response) {
-						addStepText('step-delete', escapeHTML(response.response));
+						var text = escapeHTML(response.response);
+						text += '<br><details><summary>Show detailed response</summary><pre><code>' +
+							escapeHTML(response.detailedResponseText) + '</code></pre></details>';
+						addStepText('step-delete', text);
 					}
 				}
 			},
@@ -1897,7 +2104,10 @@ if(strpos($updaterUrl, 'index.php') === false) {
 					errorStep('step-move', 10);
 
 					if(response.response) {
-						addStepText('step-move', escapeHTML(response.response));
+						var text = escapeHTML(response.response);
+						text += '<br><details><summary>Show detailed response</summary><pre><code>' +
+							escapeHTML(response.detailedResponseText) + '</code></pre></details>';
+						addStepText('step-move', text);
 					}
 				}
 			},
@@ -1910,7 +2120,10 @@ if(strpos($updaterUrl, 'index.php') === false) {
 					errorStep('step-maintenance-mode', 11);
 
 					if(response.response) {
-						addStepText('step-maintenance-mode', escapeHTML(response.response));
+						var text = escapeHTML(response.response);
+						text += '<br><details><summary>Show detailed response</summary><pre><code>' +
+							escapeHTML(response.detailedResponseText) + '</code></pre></details>';
+						addStepText('step-maintenance-mode', text);
 					}
 				}
 			},
@@ -2004,26 +2217,6 @@ if(strpos($updaterUrl, 'index.php') === false) {
 				return 'Update is in progress. Are you sure, you want to close?';
 			}
 		}
-	</script>
-<?php else: ?>
-	<script>
-		function login() {
-			var xhr = new XMLHttpRequest();
-			xhr.open('GET', window.location.href, true);
-			xhr.setRequestHeader('X-Updater-Auth', document.getElementById('updater-secret-input').value);
-			xhr.onreadystatechange = function () {
-				if (xhr.readyState === 4) {
-					document.getElementsByTagName('html')[0].innerHTML = xhr.responseText;
-					eval(document.getElementsByTagName('script')[0].innerHTML);
-				}
-			};
-			xhr.send();
-		}
-
-		document.getElementById('updater-secret-submit').onclick = function(e) {
-			e.preventDefault();
-			login();
-		};
 	</script>
 <?php endif; ?>
 

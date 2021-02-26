@@ -37,16 +37,19 @@ class UpdateCommand extends Command {
 	/** @var bool */
 	protected $shouldStop = false;
 
+	/** @var bool */
+	protected $skipBackup = false;
+
 	/** @var array strings of text for stages of updater */
 	protected $checkTexts = [
 		0 => '',
 		1 => 'Check for expected files',
 		2 => 'Check for write permissions',
-		3 => 'Enable maintenance mode',
-		4 => 'Create backup',
-		5 => 'Downloading',
-		6 => 'Verify integrity',
-		7 => 'Extracting',
+		3 => 'Create backup',
+		4 => 'Downloading',
+		5 => 'Verify integrity',
+		6 => 'Extracting',
+		7 => 'Enable maintenance mode',
 		8 => 'Replace entry points',
 		9 => 'Delete old files',
 		10 => 'Move new files in place',
@@ -58,10 +61,12 @@ class UpdateCommand extends Command {
 		$this
 			->setName('update')
 			->setDescription('Updates the code of an Nextcloud instance')
-			->setHelp("This command fetches the latest code that is announced via the updater server and safely replaces the existing code with the new one.");
+			->setHelp("This command fetches the latest code that is announced via the updater server and safely replaces the existing code with the new one.")
+			->addOption('no-backup', null, InputOption::VALUE_NONE, 'Skip backup of current Nextcloud version');
 	}
 
 	protected function execute(InputInterface $input, OutputInterface $output) {
+		$this->skipBackup = $input->getOption('no-backup');
 
 		if (class_exists('NC\Updater\Version')) {
 			$versionClass = new Version();
@@ -292,7 +297,7 @@ class UpdateCommand extends Command {
 
 			chdir($path . '/..');
 			chmod('occ', 0755); # TODO do this in the updater
-			system('./occ upgrade', $returnValue);
+			system(PHP_BINARY . ' ./occ upgrade -v', $returnValue);
 
 			$output->writeln('');
 			if ($input->isInteractive()) {
@@ -311,8 +316,8 @@ class UpdateCommand extends Command {
 			}
 
 			try {
-				$this->updater->setMaintenanceMode(false);
-				$this->updater->log('[info] maintenance mode is disabled');
+				system(PHP_BINARY . ' ./occ maintenance:mode --off', $returnValueMaintenanceMode);
+				$this->updater->log('[info] maintenance mode is disabled - return code: ' . $returnValueMaintenanceMode);
 				$output->writeln('');
 				$output->writeln('Maintenance mode is disabled');
 			} catch (\Exception $e) {
@@ -353,19 +358,21 @@ class UpdateCommand extends Command {
 					$this->updater->checkWritePermissions();
 					break;
 				case 3:
-					$this->updater->setMaintenanceMode(true);
+					if ($this->skipBackup === false) {
+						$this->updater->createBackup();
+					}
 					break;
 				case 4:
-					$this->updater->createBackup();
-					break;
-				case 5:
 					$this->updater->downloadUpdate();
 					break;
-				case 6:
+				case 5:
 					$this->updater->verifyIntegrity();
 					break;
-				case 7:
+				case 6:
 					$this->updater->extractDownload();
+					break;
+				case 7:
+					$this->updater->setMaintenanceMode(true);
 					break;
 				case 8:
 					$this->updater->replaceEntryPoints();
